@@ -1,6 +1,8 @@
 
 #include "rdma_common.h"
 
+#define SERVER_DATA_LEN 100000
+
 /* RDMA 리소스를 관리할 구조체 */
 struct rdma_server_resources
 {
@@ -14,8 +16,9 @@ struct rdma_server_resources
 
 	struct ibv_mr *server_buffer_mr;
 
-	struct rdma_buffer_attr metadata_attr;
+	char *server_buffer;
 };
+
 /* 서버 종료 및 리소스 정리 */
 static int server_disconnect_and_cleanup(struct rdma_server_resources *res)
 {
@@ -36,11 +39,11 @@ static int server_disconnect_and_cleanup(struct rdma_server_resources *res)
 	// 클라이언트가 write한 데이터를 출력
 	printf("Client wrote the following data: %s\n", (char *)res->server_buffer_mr->addr);
 
-	rdma_buffer_free(res->server_buffer_mr);
+	rdma_buffer_deregister(res->server_buffer_mr);
 	ibv_dealloc_pd(res->pd);
 	rdma_destroy_id(res->cm_server_id);
 	rdma_destroy_event_channel(res->cm_event_channel);
-
+	free(res->server_buffer);
 	printf("Server shut-down is complete \n");
 	return 0;
 }
@@ -75,6 +78,12 @@ static int server_prepare_connection(struct sockaddr_in *server_addr, struct rdm
 
 	printf("Server is listening at: %s, port: %d\n", inet_ntoa(server_addr->sin_addr), ntohs(server_addr->sin_port));
 
+	return 0;
+}
+
+/* 서버 메타데이터를 클라이언트로 전송 */
+static int server_accept_client_and_send_metadata(struct rdma_server_resources *res)
+{
 	struct rdma_cm_event *cm_event = NULL;
 	int ret = process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_CONNECT_REQUEST, &cm_event);
 	if (ret)
@@ -82,6 +91,8 @@ static int server_prepare_connection(struct sockaddr_in *server_addr, struct rdm
 		rdma_error("Failed to get CM event\n");
 		return ret;
 	}
+	printf("Server is get cm event at: ");
+	show_rdma_cmid(cm_event->id);
 
 	res->cm_client_id = cm_event->id;
 	rdma_ack_cm_event(cm_event);
@@ -142,24 +153,6 @@ static int server_prepare_connection(struct sockaddr_in *server_addr, struct rdm
 
 	res->qp = res->cm_client_id->qp;
 
-	return 0;
-}
-
-static int server_alloc_memory(struct rdma_server_resources *res, uint32_t length)
-{
-	// 서버 버퍼 할당
-	res->server_buffer_mr = rdma_buffer_alloc(res->pd, length, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
-
-	if (!res->server_buffer_mr)
-	{
-		rdma_error("Failed to allocate server buffer\n");
-		return -ENOMEM;
-	}
-}
-
-/* 서버 메타데이터를 클라이언트로 전송 */
-static int server_accept_client_and_send_metadata(struct rdma_server_resources *res)
-{
 	struct rdma_conn_param conn_param = {
 		.initiator_depth = 3,
 		.responder_resources = 3,
@@ -170,14 +163,17 @@ static int server_accept_client_and_send_metadata(struct rdma_server_resources *
 		return -errno;
 	}
 
-	struct rdma_cm_event *cm_event = NULL;
-	if (process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_ESTABLISHED, &cm_event))
+	struct rdma_cm_event *cm_event2 = NULL;
+	if (process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_ESTABLISHED, &cm_event2))
 	{
 		rdma_error("Failed to get CM event\n");
 		return -errno;
 	}
 
-	rdma_ack_cm_event(cm_event);
+	rdma_ack_cm_event(cm_event2);
+
+	// 서버 server_buffer 연결
+	res->server_buffer_mr = rdma_buffer_register(res->pd, res->server_buffer, SERVER_DATA_LEN, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
 
 	struct rdma_buffer_attr server_metadata_attr = {
 		.address = (uint64_t)res->server_buffer_mr->addr,
@@ -217,8 +213,6 @@ static int server_accept_client_and_send_metadata(struct rdma_server_resources *
 	return 0;
 }
 
-#define SERVER_DATA_LEN 100000
-
 /* Main function */
 int main(int argc, char **argv)
 {
@@ -233,6 +227,14 @@ int main(int argc, char **argv)
 	server_sockaddr.sin_addr.s_addr = inet_addr("10.10.16.51");
 	server_sockaddr.sin_port = htons(DEFAULT_RDMA_PORT);
 
+	/* Allocate Server buffer*/
+	res.server_buffer = calloc(1, SERVER_DATA_LEN);
+	if (!res.server_buffer)
+	{
+		rdma_error("failed to allocate buffer, -ENOMEM\n");
+		return ret;
+	}
+
 	/* Start RDMA server */
 	ret = server_prepare_connection(&server_sockaddr, &res);
 	if (ret)
@@ -240,8 +242,6 @@ int main(int argc, char **argv)
 		rdma_error("Failed to start RDMA server\n");
 		return ret;
 	}
-
-	server_alloc_memory(&res, SERVER_DATA_LEN);
 
 	/* Send server metadata */
 	ret = server_accept_client_and_send_metadata(&res);
