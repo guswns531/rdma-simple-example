@@ -429,6 +429,7 @@ int main(int argc, char **argv)
 		printf("SUCCESS: source and destination buffers match\n");
 	}
 
+	sleep(10);
 	ret = client_disconnect_and_clean(&res);
 	return ret;
 }

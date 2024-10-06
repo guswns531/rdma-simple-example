@@ -42,10 +42,6 @@ static int server_disconnect_wait(struct rdma_server_resources *res)
 /* 서버 종료 및 리소스 정리 */
 static int server_cleanup(struct rdma_server_resources *res)
 {
-	server_disconnect_wait(res);
-	// 클라이언트가 write한 데이터를 출력
-	printf("Client wrote the following data: %s\n", (char *)res->server_buffer);
-
 	for (int i = 0; i < res->num_clients; i++)
 	{
 		struct rdma_connected_client_resources *client_res = res->client_res[i];
@@ -279,13 +275,20 @@ int main(int argc, char **argv)
 		return ret;
 	}
 
-	/* Send server metadata */
-	ret = server_accept_client_and_send_metadata(&res);
-	if (ret)
+	for (int i = 0; i < 2; i++)
 	{
-		rdma_error("Failed to send server metadata\n");
-		return ret;
+		/* Send server metadata */
+		ret = server_accept_client_and_send_metadata(&res);
+		if (ret)
+		{
+			rdma_error("Failed to send server metadata\n");
+			return ret;
+		}
 	}
+
+	server_disconnect_wait(&res);
+	// 클라이언트가 write한 데이터를 출력
+	printf("Client wrote the following data: %s\n", (char *)res.server_buffer);
 
 	/* Disconnect and cleanup */
 	ret = server_cleanup(&res);
