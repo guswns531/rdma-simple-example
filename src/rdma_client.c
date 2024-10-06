@@ -55,11 +55,6 @@ static int client_disconnect_and_clean(struct rdma_client_resources *res)
 	return 0;
 }
 
-/* 메모리 비교 함수 */
-static int check_src_dst(struct rdma_client_resources *res)
-{
-	return memcmp((void *)res->src, (void *)res->dst, strlen(res->src));
-}
 /* Helper function to post RDMA send operation */
 static int rdma_post_send(struct ibv_qp *qp, enum ibv_wr_opcode opcode, uint64_t local_addr, uint32_t length, uint32_t lkey, uint64_t remote_addr, uint32_t rkey)
 {
@@ -160,23 +155,6 @@ static int client_remote_memory_read(struct rdma_client_resources *res)
 	return 0;
 }
 
-/* Helper function for RDMA CM event handling */
-static int cm_event_ack_and_process(struct rdma_event_channel *event_channel, enum rdma_cm_event_type expected_event, struct rdma_cm_event **cm_event)
-{
-	int ret = process_rdma_cm_event(event_channel, expected_event, cm_event);
-	if (ret)
-		return ret;
-
-	ret = rdma_ack_cm_event(*cm_event);
-	if (ret)
-	{
-		rdma_error("Failed to acknowledge CM event, errno: %d\n", -errno);
-		return -errno;
-	}
-
-	return 0;
-}
-
 /* 클라이언트 연결 준비 함수 */
 static int client_prepare_connection(struct sockaddr_in *s_addr, struct rdma_client_resources *res)
 {
@@ -206,9 +184,11 @@ static int client_prepare_connection(struct sockaddr_in *s_addr, struct rdma_cli
 
 	/* 주소 해석 이벤트 확인 */
 	struct rdma_cm_event *cm_event = NULL;
-	ret = cm_event_ack_and_process(res->cm_event_channel, RDMA_CM_EVENT_ADDR_RESOLVED, &cm_event);
+	ret = process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_ADDR_RESOLVED, &cm_event);
 	if (ret)
 		return ret;
+
+	rdma_ack_cm_event(cm_event);
 
 	/* 경로 해석 */
 	ret = rdma_resolve_route(res->cm_client_id, 2000);
@@ -219,9 +199,10 @@ static int client_prepare_connection(struct sockaddr_in *s_addr, struct rdma_cli
 	}
 
 	/* 경로 해석 이벤트 확인 */
-	ret = cm_event_ack_and_process(res->cm_event_channel, RDMA_CM_EVENT_ROUTE_RESOLVED, &cm_event);
+	ret = process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_ROUTE_RESOLVED, &cm_event);
 	if (ret)
 		return ret;
+	rdma_ack_cm_event(cm_event);
 
 	/* 보호 도메인 할당 */
 	res->pd = ibv_alloc_pd(res->cm_client_id->verbs);
@@ -347,10 +328,10 @@ static int client_connect_to_server_and_get_metadata(struct rdma_client_resource
 	sleep(1);
 
 	struct rdma_cm_event *cm_event = NULL;
-	ret = cm_event_ack_and_process(res->cm_event_channel, RDMA_CM_EVENT_ESTABLISHED, &cm_event);
+	ret = process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_ESTABLISHED, &cm_event);
 	if (ret)
 		return ret;
-
+	rdma_ack_cm_event(cm_event);
 	printf("The client is connected successfully\n");
 
 	struct ibv_wc wc;
@@ -374,8 +355,17 @@ int main(int argc, char **argv)
 	struct rdma_client_resources res;
 	memset(&res, 0, sizeof(res));
 
-	const char *text_to_send = "textstring";
-	res.src = calloc(strlen(text_to_send), 1);
+	// 입력 인자 확인
+	if (argc < 2)
+	{
+		rdma_error("Usage: %s <text_to_send>\n", argv[0]);
+		return -1;
+	}
+
+	const char *text_to_send = argv[1]; // 첫 번째 인자로부터 데이터 받음
+
+	// 전송할 데이터의 메모리 할당
+	res.src = calloc(strlen(text_to_send) + 1, 1); // 널문자 포함하여 메모리 할당
 	if (!res.src)
 	{
 		rdma_error("Failed to allocate memory: -ENOMEM\n");
@@ -383,22 +373,24 @@ int main(int argc, char **argv)
 	}
 	strncpy(res.src, text_to_send, strlen(text_to_send));
 
-	res.dst = calloc(strlen(text_to_send), 1);
+	// 수신 데이터 저장 메모리 할당
+	res.dst = calloc(strlen(text_to_send) + 1, 1); // 널문자 포함하여 메모리 할당
 	if (!res.dst)
 	{
 		rdma_error("Failed to allocate destination memory, -ENOMEM\n");
-		free(res.src);
 		return -ENOMEM;
 	}
 
 	int ret;
 
+	// 서버 소켓 주소 초기화
 	struct sockaddr_in server_sockaddr;
 	memset(&server_sockaddr, 0, sizeof(server_sockaddr));
 	server_sockaddr.sin_family = AF_INET;
 	server_sockaddr.sin_addr.s_addr = inet_addr("10.10.16.51");
 	server_sockaddr.sin_port = htons(DEFAULT_RDMA_PORT);
 
+	// 클라이언트 연결 준비
 	ret = client_prepare_connection(&server_sockaddr, &res);
 	if (ret)
 	{
@@ -406,30 +398,32 @@ int main(int argc, char **argv)
 		return ret;
 	}
 
+	// 서버에 연결하고 메타데이터 수신
 	ret = client_connect_to_server_and_get_metadata(&res);
 	if (ret)
 	{
 		return ret;
 	}
 
+	// 원격 메모리로 데이터 전송
 	ret = client_remote_memory_write(&res);
 	if (ret)
+	{
 		return ret;
+	}
 
+	// 원격 메모리에서 데이터 읽기
 	ret = client_remote_memory_read(&res);
 	if (ret)
+	{
 		return ret;
-
-	if (check_src_dst(&res))
-	{
-		rdma_error("src and dst buffers do not match\n");
-	}
-	else
-	{
-		printf("SUCCESS: source and destination buffers match\n");
 	}
 
+	// 잠시 대기
 	sleep(10);
+
+	// 연결 해제 및 리소스 정리
 	ret = client_disconnect_and_clean(&res);
+
 	return ret;
 }
