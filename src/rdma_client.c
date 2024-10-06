@@ -326,6 +326,7 @@ static int client_connect_to_server_and_get_metadata(struct rdma_client_resource
 	{
 		return ret;
 	}
+	printf("Lets connect\n");
 
 	struct rdma_conn_param conn_param;
 	memset(&conn_param, 0, sizeof(conn_param));
@@ -333,12 +334,17 @@ static int client_connect_to_server_and_get_metadata(struct rdma_client_resource
 	conn_param.responder_resources = 3;
 	conn_param.retry_count = 3;
 
+	sleep(1);
+
 	ret = rdma_connect(res->cm_client_id, &conn_param);
 	if (ret)
 	{
 		rdma_error("Failed to connect to remote host, errno: %d\n", -errno);
 		return -errno;
 	}
+
+	printf("try connect\n");
+	sleep(1);
 
 	struct rdma_cm_event *cm_event = NULL;
 	ret = cm_event_ack_and_process(res->cm_event_channel, RDMA_CM_EVENT_ESTABLISHED, &cm_event);
