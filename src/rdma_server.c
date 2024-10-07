@@ -3,6 +3,12 @@
 
 #define SERVER_DATA_LEN 100000
 
+struct buffer
+{
+	uint64_t flag;
+	char str[1000000];
+};
+
 /* 각 클라이언트의 RDMA 리소스를 관리할 구조체 */
 struct rdma_connected_client_resources
 {
@@ -23,7 +29,7 @@ struct rdma_server_resources
 	int num_clients;									 // 현재 연결된 클라이언트 수
 	struct rdma_connected_client_resources **client_res; // 클라이언트 배열
 
-	char *server_buffer;
+	struct buffer server_buffer;
 };
 
 static int server_disconnect_wait(struct rdma_server_resources *res)
@@ -154,8 +160,9 @@ static int server_prepare_connection(struct sockaddr_in *server_addr, struct rdm
 /* 클라이언트의 메타데이터 전송 */
 static int server_send_metadata(struct rdma_connected_client_resources *client_res, struct rdma_server_resources *res)
 {
+	printf("Send Metadata\n");
 	// 서버 버퍼 등록
-	client_res->server_buffer_mr = rdma_buffer_register(client_res->pd, res->server_buffer, SERVER_DATA_LEN, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
+	client_res->server_buffer_mr = rdma_buffer_register(client_res->pd, &res->server_buffer, sizeof(res->server_buffer), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
 
 	struct rdma_buffer_attr server_metadata_attr = {
 		.address = (uint64_t)client_res->server_buffer_mr->addr,
@@ -256,6 +263,7 @@ static int server_accept_client(struct rdma_server_resources *res)
 /* 서버 종료 및 클라이언트 리소스 해제 */
 static int server_cleanup(struct rdma_server_resources *res)
 {
+	printf("Star Server shut-down is complete\n");
 	for (int i = 0; i < res->num_clients; i++)
 	{
 		struct rdma_connected_client_resources *client_res = res->client_res[i];
@@ -272,7 +280,7 @@ static int server_cleanup(struct rdma_server_resources *res)
 	rdma_destroy_id(res->cm_server_id);
 	rdma_destroy_event_channel(res->cm_event_channel);
 	free(res->client_res);
-	free(res->server_buffer);
+	// free(res->server_buffer.str);
 	printf("Server shut-down is complete\n");
 	return 0;
 }
@@ -291,13 +299,19 @@ int main(int argc, char **argv)
 	server_sockaddr.sin_addr.s_addr = inet_addr("10.10.16.51");
 	server_sockaddr.sin_port = htons(DEFAULT_RDMA_PORT);
 
+	const char *text_to_send = argv[1]; // 첫 번째 인자로부터 데이터 받음
+
 	/* Allocate Server buffer*/
-	res.server_buffer = calloc(1, SERVER_DATA_LEN);
-	if (!res.server_buffer)
-	{
-		rdma_error("failed to allocate buffer, -ENOMEM\n");
-		return ret;
-	}
+	// res.server_buffer.str = calloc(1, SERVER_DATA_LEN);
+	// if (!res.server_buffer.str)
+	// {
+	// 	rdma_error("failed to allocate buffer, -ENOMEM\n");
+	// 	return ret;
+	// }
+
+	strncpy(res.server_buffer.str, text_to_send, strlen(text_to_send));
+
+	printf("server_buffer %s\n", res.server_buffer.str);
 
 	/* Start RDMA server */
 	ret = server_prepare_connection(&server_sockaddr, &res);
@@ -322,8 +336,9 @@ int main(int argc, char **argv)
 	{
 		server_disconnect_wait(&res);
 	}
+
 	// 클라이언트가 write한 데이터를 출력
-	printf("Client wrote the following data: %s\n", (char *)res.server_buffer);
+	printf("Client wrote the following data: %s\n", res.server_buffer.str);
 
 	/* Disconnect and cleanup */
 	ret = server_cleanup(&res);

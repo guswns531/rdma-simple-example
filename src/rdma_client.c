@@ -1,5 +1,11 @@
 #include "rdma_common.h"
 
+struct buffer
+{
+	uint64_t flag;
+	char str[1000000];
+};
+
 /* RDMA 리소스를 관리할 구조체 */
 struct rdma_client_resources
 {
@@ -10,15 +16,13 @@ struct rdma_client_resources
 	struct ibv_cq *cq;
 	struct ibv_qp *qp;
 
-	struct ibv_mr *client_src_mr;
-	struct ibv_mr *client_dst_mr;
+	struct ibv_mr *client_buffer_mr;
 	struct rdma_buffer_attr metadata_attr;
-	char *src;
-	char *dst;
+
+	struct buffer client_buffer;
 };
 
-/* 클라이언트 종료 및 리소스 정리 */
-static int client_disconnect_and_clean(struct rdma_client_resources *res)
+static int client_disconnect(struct rdma_client_resources *res)
 {
 	struct rdma_cm_event *cm_event = NULL;
 	int ret = -1;
@@ -36,19 +40,20 @@ static int client_disconnect_and_clean(struct rdma_client_resources *res)
 	}
 
 	rdma_ack_cm_event(cm_event);
+	return 0;
+}
 
+/* 클라이언트 종료 및 리소스 정리 */
+static int client_cleanup(struct rdma_client_resources *res)
+{
 	rdma_destroy_qp(res->cm_client_id);
 	rdma_destroy_id(res->cm_client_id);
 
 	ibv_destroy_cq(res->cq);
 	ibv_destroy_comp_channel(res->io_completion_channel);
 
-	rdma_buffer_deregister(res->client_src_mr);
-	rdma_buffer_deregister(res->client_dst_mr);
-
-	free(res->src);
-	free(res->dst);
-
+	rdma_buffer_deregister(res->client_buffer_mr);
+	// free(res->client_buffer.str);
 	ibv_dealloc_pd(res->pd);
 	rdma_destroy_event_channel(res->cm_event_channel);
 	printf("클라이언트 리소스 정리 완료 \n");
@@ -92,20 +97,11 @@ static int rdma_post_send(struct ibv_qp *qp, enum ibv_wr_opcode opcode, uint64_t
 }
 
 /* Remote Memory Write */
-static int client_remote_memory_write(struct rdma_client_resources *res)
+static int client_rdma_write(struct rdma_client_resources *res)
 {
-	/* Register source buffer */
-	res->client_src_mr = rdma_buffer_register(res->pd, res->src, strlen(res->src),
-											  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE);
-	if (!res->client_src_mr)
-	{
-		rdma_error("Failed to register source buffer\n");
-		return -ENOMEM;
-	}
-
 	/* Post RDMA write operation */
 	int ret = rdma_post_send(res->qp, IBV_WR_RDMA_WRITE,
-							 (uint64_t)res->client_src_mr->addr, res->client_src_mr->length, res->client_src_mr->lkey,
+							 (uint64_t)res->client_buffer_mr->addr, res->client_buffer_mr->length, res->client_buffer_mr->lkey,
 							 res->metadata_attr.address, res->metadata_attr.stag.remote_stag);
 	if (ret)
 		return ret;
@@ -119,28 +115,23 @@ static int client_remote_memory_write(struct rdma_client_resources *res)
 		return ret;
 	}
 
-	printf("Client WRITE completed: %s\n", res->src);
+	struct buffer *getdata = (struct buffer *)res->client_buffer_mr->addr;
+	printf("Client Write completed: %ld, %s\n", getdata->flag, getdata->str);
 	return 0;
 }
 
 /* Remote Memory Read */
-static int client_remote_memory_read(struct rdma_client_resources *res)
+static int client_rdma_read(struct rdma_client_resources *res)
 {
-	/* Register destination buffer */
-	res->client_dst_mr = rdma_buffer_register(res->pd, res->dst, strlen(res->src),
-											  IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ);
-	if (!res->client_dst_mr)
-	{
-		rdma_error("Failed to register destination buffer\n");
-		return -ENOMEM;
-	}
-
 	/* Post RDMA read operation */
 	int ret = rdma_post_send(res->qp, IBV_WR_RDMA_READ,
-							 (uint64_t)res->client_dst_mr->addr, res->client_dst_mr->length, res->client_dst_mr->lkey,
+							 (uint64_t)res->client_buffer_mr->addr, res->client_buffer_mr->length, res->client_buffer_mr->lkey,
 							 res->metadata_attr.address, res->metadata_attr.stag.remote_stag);
 	if (ret)
+	{
+		printf("client read error");
 		return ret;
+	}
 
 	/* Process the work completion */
 	struct ibv_wc wc;
@@ -151,7 +142,69 @@ static int client_remote_memory_read(struct rdma_client_resources *res)
 		return ret;
 	}
 
-	printf("Client READ completed: %s\n", res->dst);
+	struct buffer *getdata = (struct buffer *)res->client_buffer_mr->addr;
+	printf("Client read completed: %ld, %s\n", getdata->flag, getdata->str);
+	return 0;
+}
+
+/* Helper function to post RDMA Compare and Swap (CMP_AND_SWAP) operation */
+static int rdma_post_compare_and_swap(struct ibv_qp *qp, uint64_t compare_val, uint64_t swap_val, uint64_t local_addr, uint32_t lkey, uint64_t remote_addr, uint32_t rkey)
+{
+	int ret;
+	struct ibv_sge send_sge = {
+		.addr = local_addr,
+		.length = sizeof(uint64_t), // CMP_AND_SWAP 연산은 64비트(8바이트) 값을 사용합니다.
+		.lkey = lkey,
+	};
+
+	struct ibv_send_wr send_wr = {
+		.sg_list = &send_sge,
+		.num_sge = 1,
+		.opcode = IBV_WR_ATOMIC_CMP_AND_SWP, // Atomic Compare and Swap
+		.send_flags = IBV_SEND_SIGNALED,
+		.wr.atomic.remote_addr = remote_addr, // 원격 주소
+		.wr.atomic.rkey = rkey,				  // 원격 키
+		.wr.atomic.compare_add = compare_val, // 비교할 값
+		.wr.atomic.swap = swap_val,			  // 교환할 값
+	};
+
+	struct ibv_send_wr *bad_send_wr = NULL;
+
+	/* Post the CMP_AND_SWAP request */
+	ret = ibv_post_send(qp, &send_wr, &bad_send_wr);
+	if (ret)
+	{
+		rdma_error("Failed to post CMP_AND_SWAP operation, errno: %d\n", -errno);
+		if (bad_send_wr)
+		{
+			fprintf(stderr, "Error: bad_send_wr at %p\n", (void *)bad_send_wr);
+		}
+		return -errno;
+	}
+
+	return 0;
+}
+
+/* Remote CMP_AND_SWAP Operation */
+static int client_rdma_compare_and_swap(struct rdma_client_resources *res, uint64_t compare_val, uint64_t swap_val)
+{
+	/* Post RDMA CMP_AND_SWAP operation */
+	int ret = rdma_post_compare_and_swap(res->qp, compare_val, swap_val,
+										 (uint64_t)res->client_buffer_mr->addr, res->client_buffer_mr->lkey,
+										 res->metadata_attr.address, res->metadata_attr.stag.remote_stag);
+	if (ret)
+		return ret;
+
+	/* Process the work completion */
+	struct ibv_wc wc;
+	ret = process_work_completion_events(res->io_completion_channel, &wc, 1);
+	if (ret != 1)
+	{
+		rdma_error("Failed to get 1 work completion for CMP_AND_SWAP, ret = %d\n", ret);
+		return ret;
+	}
+
+	printf("CMP_AND_SWAP operation completed. Result: %lu\n", *(uint64_t *)res->client_buffer_mr->addr);
 	return 0;
 }
 
@@ -295,12 +348,12 @@ static int client_prepare_recv_metadata(struct rdma_client_resources *res)
 		return ret;
 	}
 
-	rdma_buffer_deregister(server_metadata_mr);
+	// rdma_buffer_deregister(server_metadata_mr);
 	return 0;
 }
 
 /* Metadata Exchange */
-static int client_connect_to_server_and_get_metadata(struct rdma_client_resources *res)
+static int client_connect_to_server(struct rdma_client_resources *res)
 {
 	int ret = client_prepare_recv_metadata(res);
 	if (ret)
@@ -346,6 +399,17 @@ static int client_connect_to_server_and_get_metadata(struct rdma_client_resource
 
 	printf("The client recevied metadata successfully\n");
 
+	/* Register source buffer */
+	res->client_buffer_mr = rdma_buffer_register(res->pd, &res->client_buffer, sizeof(res->client_buffer),
+												 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
+	if (!res->client_buffer_mr)
+	{
+		rdma_error("Failed to register source buffer %ld\n", sizeof(res->client_buffer));
+		return -ENOMEM;
+	}
+
+	printf("The client allocted buffuer  %ld\n", sizeof(res->client_buffer));
+
 	return 0;
 }
 
@@ -364,22 +428,7 @@ int main(int argc, char **argv)
 
 	const char *text_to_send = argv[1]; // 첫 번째 인자로부터 데이터 받음
 
-	// 전송할 데이터의 메모리 할당
-	res.src = calloc(strlen(text_to_send) + 1, 1); // 널문자 포함하여 메모리 할당
-	if (!res.src)
-	{
-		rdma_error("Failed to allocate memory: -ENOMEM\n");
-		return -ENOMEM;
-	}
-	strncpy(res.src, text_to_send, strlen(text_to_send));
-
-	// 수신 데이터 저장 메모리 할당
-	res.dst = calloc(strlen(text_to_send) + 1, 1); // 널문자 포함하여 메모리 할당
-	if (!res.dst)
-	{
-		rdma_error("Failed to allocate destination memory, -ENOMEM\n");
-		return -ENOMEM;
-	}
+	strncpy(res.client_buffer.str, text_to_send, strlen(text_to_send));
 
 	int ret;
 
@@ -399,21 +448,49 @@ int main(int argc, char **argv)
 	}
 
 	// 서버에 연결하고 메타데이터 수신
-	ret = client_connect_to_server_and_get_metadata(&res);
+	ret = client_connect_to_server(&res);
 	if (ret)
 	{
 		return ret;
 	}
+	printf("Hello\n");
+	// 원격 메모리에서 데이터 읽기
+	ret = client_rdma_read(&res);
+	if (ret)
+	{
+		return ret;
+	}
+
+	res.client_buffer.flag = 0;
+	memset(&res.client_buffer.str, 0, sizeof(res.client_buffer.str));
+
+	ret = client_rdma_compare_and_swap(&res, 0, 2);
+	if (ret)
+	{
+		return ret;
+	}
+
+	ret = client_rdma_read(&res);
+	if (ret)
+	{
+		return ret;
+	}
+
+	res.client_buffer.flag = 5;
+	strncpy(res.client_buffer.str, text_to_send, strlen(text_to_send));
 
 	// 원격 메모리로 데이터 전송
-	ret = client_remote_memory_write(&res);
+	ret = client_rdma_write(&res);
 	if (ret)
 	{
 		return ret;
 	}
 
+	res.client_buffer.flag = 3;
+	memset(&res.client_buffer.str, 0, sizeof(res.client_buffer.str));
+
 	// 원격 메모리에서 데이터 읽기
-	ret = client_remote_memory_read(&res);
+	ret = client_rdma_read(&res);
 	if (ret)
 	{
 		return ret;
@@ -423,7 +500,8 @@ int main(int argc, char **argv)
 	sleep(10);
 
 	// 연결 해제 및 리소스 정리
-	ret = client_disconnect_and_clean(&res);
+	ret = client_disconnect(&res);
+	ret = client_cleanup(&res);
 
 	return ret;
 }
