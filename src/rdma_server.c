@@ -32,24 +32,22 @@ struct rdma_server_resources
 	struct buffer server_buffer;
 };
 
+/* 에러 메시지 출력과 코드 반환을 단일 함수로 처리 */
+static inline int handle_error(const char *error_message)
+{
+	perror(error_message); // perror를 사용하여 오류 메시지와 errno 값을 출력
+	return -errno;		   // errno 값을 반환
+}
+
 static int server_disconnect_wait(struct rdma_server_resources *res)
 {
 	struct rdma_cm_event *cm_event = NULL;
 	int ret = process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_DISCONNECTED, &cm_event);
 	if (ret)
-	{
-		rdma_error("Failed to get RDMA_CM_EVENT_DISCONNECTED event\n");
-		return ret;
-	}
+		return handle_error("Failed to get RDMA_CM_EVENT_DISCONNECTED event\n");
+
 	printf("Disconnect RDMA cm id at %p \n", cm_event->id);
 	rdma_ack_cm_event(cm_event);
-}
-
-/* 에러 메시지 출력과 코드 반환을 단일 함수로 처리 */
-static inline int handle_error(const char *error_message, int err_code)
-{
-	rdma_error("%s, errno: %d\n", error_message, -errno);
-	return err_code;
 }
 
 /* 클라이언트 리소스를 초기화 */
@@ -101,9 +99,91 @@ static struct rdma_connected_client_resources *server_init_client_resources(stru
 	return client_res;
 }
 
-/* 큐 페어(QP)를 초기화 */
-static int server_init_qp(struct rdma_connected_client_resources *client_res)
+/* 서버 리소스를 초기화 */
+static int server_prepare_connection(struct sockaddr_in *server_addr, struct rdma_server_resources *res)
 {
+	// 이벤트 채널 생성
+	res->cm_event_channel = rdma_create_event_channel();
+	if (!res->cm_event_channel)
+		return handle_error("Failed to create event channel");
+
+	// 서버 CM ID 생성
+	if (rdma_create_id(res->cm_event_channel, &res->cm_server_id, NULL, RDMA_PS_TCP))
+		return handle_error("Failed to create server cm id");
+
+	// 서버 주소 바인딩
+	if (rdma_bind_addr(res->cm_server_id, (struct sockaddr *)server_addr))
+		return handle_error("Failed to bind server address");
+
+	// 서버 리스닝 시작
+	if (rdma_listen(res->cm_server_id, 8))
+		return handle_error("Failed to listen on server address");
+
+	printf("Server is listening at: %s, port: %d\n", inet_ntoa(server_addr->sin_addr), ntohs(server_addr->sin_port));
+	return 0;
+}
+
+/* 메타데이터 전송 */
+static int server_send_metadata(struct rdma_connected_client_resources *client_res, struct rdma_server_resources *res)
+{
+	printf("Send Metadata\n");
+
+	client_res->server_buffer_mr = rdma_buffer_register(client_res->pd, &res->server_buffer, sizeof(res->server_buffer),
+														IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
+	if (!client_res->server_buffer_mr)
+		return handle_error("Failed to register server buffer");
+
+	struct rdma_buffer_attr server_metadata_attr = {
+		.address = (uint64_t)client_res->server_buffer_mr->addr,
+		.length = (uint32_t)client_res->server_buffer_mr->length,
+		.stag.local_stag = (uint32_t)client_res->server_buffer_mr->lkey,
+	};
+
+	struct ibv_mr *server_metadata_mr = rdma_buffer_register(client_res->pd, &server_metadata_attr, sizeof(server_metadata_attr), IBV_ACCESS_LOCAL_WRITE);
+	if (!server_metadata_mr)
+		return handle_error("Failed to register server metadata");
+
+	struct ibv_sge send_sge = {
+		.addr = (uint64_t)&server_metadata_attr,
+		.length = sizeof(server_metadata_attr),
+		.lkey = server_metadata_mr->lkey,
+	};
+
+	struct ibv_send_wr send_wr = {
+		.sg_list = &send_sge,
+		.num_sge = 1,
+		.opcode = IBV_WR_SEND,
+		.send_flags = IBV_SEND_SIGNALED,
+	};
+
+	struct ibv_send_wr *bad_send_wr = NULL;
+	if (ibv_post_send(client_res->qp, &send_wr, &bad_send_wr))
+		return handle_error("Failed to post send WR");
+
+	struct ibv_wc wc;
+	if (process_work_completion_events(client_res->io_completion_channel, &wc, 1) != 1)
+		return handle_error("Failed to send server metadata");
+
+	rdma_buffer_deregister(server_metadata_mr);
+	return 0;
+}
+
+/* 클라이언트 연결 및 메타데이터 전송 */
+static int server_accept_client(struct rdma_server_resources *res)
+{
+	struct rdma_cm_event *cm_event = NULL;
+	int ret = process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_CONNECT_REQUEST, &cm_event);
+	if (ret)
+		return handle_error("Failed to get RDMA_CM_EVENT_CONNECT_REQUEST");
+
+	printf("Connect RDMA cm id at %p\n", cm_event->id);
+
+	struct rdma_connected_client_resources *client_res = server_init_client_resources(cm_event->id);
+	if (!client_res)
+		return handle_error("Failed to initialize client resources");
+
+	rdma_ack_cm_event(cm_event);
+
 	struct ibv_qp_init_attr qp_init_attr = {
 		.cap = {
 			.max_recv_sge = MAX_SGE,
@@ -116,154 +196,46 @@ static int server_init_qp(struct rdma_connected_client_resources *client_res)
 		.send_cq = client_res->cq,
 	};
 
-	// 큐 페어 생성
 	if (rdma_create_qp(client_res->cm_client_id, client_res->pd, &qp_init_attr))
-	{
-		return handle_error("Failed to create QP", -errno);
-	}
+		return handle_error("Failed to create QP");
+
 	client_res->qp = client_res->cm_client_id->qp;
 
-	return 0;
-}
-
-/* 서버 리소스를 초기화 */
-static int server_prepare_connection(struct sockaddr_in *server_addr, struct rdma_server_resources *res)
-{
-	// 이벤트 채널 생성
-	res->cm_event_channel = rdma_create_event_channel();
-	if (!res->cm_event_channel)
-		return handle_error("Failed to create event channel", -errno);
-
-	// 서버 CM ID 생성
-	if (rdma_create_id(res->cm_event_channel, &res->cm_server_id, NULL, RDMA_PS_TCP))
-	{
-		return handle_error("Failed to create server cm id", -errno);
-	}
-
-	// 서버 주소 바인딩
-	if (rdma_bind_addr(res->cm_server_id, (struct sockaddr *)server_addr))
-	{
-		return handle_error("Failed to bind server address", -errno);
-	}
-
-	// 서버 리스닝 시작
-	if (rdma_listen(res->cm_server_id, 8))
-	{
-		return handle_error("Failed to listen on server address", -errno);
-	}
-
-	printf("Server is listening at: %s, port: %d\n", inet_ntoa(server_addr->sin_addr), ntohs(server_addr->sin_port));
-
-	return 0;
-}
-
-/* 클라이언트의 메타데이터 전송 */
-static int server_send_metadata(struct rdma_connected_client_resources *client_res, struct rdma_server_resources *res)
-{
-	printf("Send Metadata\n");
-	// 서버 버퍼 등록
-	client_res->server_buffer_mr = rdma_buffer_register(client_res->pd, &res->server_buffer, sizeof(res->server_buffer), IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
-
-	struct rdma_buffer_attr server_metadata_attr = {
-		.address = (uint64_t)client_res->server_buffer_mr->addr,
-		.length = (uint32_t)client_res->server_buffer_mr->length,
-		.stag.local_stag = (uint32_t)client_res->server_buffer_mr->lkey,
-	};
-
-	struct ibv_mr *server_metadata_mr = rdma_buffer_register(client_res->pd, &server_metadata_attr, sizeof(server_metadata_attr), IBV_ACCESS_LOCAL_WRITE);
-
-	struct ibv_sge send_sge = {
-		.addr = (uint64_t)&server_metadata_attr,
-		.length = sizeof(server_metadata_attr),
-		.lkey = server_metadata_mr->lkey,
-	};
-	struct ibv_send_wr send_wr = {
-		.sg_list = &send_sge,
-		.num_sge = 1,
-		.opcode = IBV_WR_SEND,
-		.send_flags = IBV_SEND_SIGNALED,
-	};
-	struct ibv_send_wr *bad_send_wr = NULL;
-
-	if (ibv_post_send(client_res->qp, &send_wr, &bad_send_wr))
-	{
-		return handle_error("Failed to post send WR", -errno);
-	}
-
-	struct ibv_wc wc;
-	if (process_work_completion_events(client_res->io_completion_channel, &wc, 1) != 1)
-	{
-		return handle_error("Failed to send server metadata", -errno);
-	}
-
-	rdma_buffer_deregister(server_metadata_mr);
-	return 0;
-}
-
-/* 클라이언트 연결 및 메타데이터 전송 처리 */
-static int server_accept_client(struct rdma_server_resources *res)
-{
-	struct rdma_cm_event *cm_event = NULL;
-	int ret = process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_CONNECT_REQUEST, &cm_event);
-	if (ret)
-		return handle_error("Failed to get CM event", ret);
-
-	printf("Connect RDMA cm id at %p \n", cm_event->id);
-
-	// 클라이언트 리소스 초기화
-	struct rdma_connected_client_resources *client_res = server_init_client_resources(cm_event->id);
-	if (!client_res)
-		return handle_error("Failed to initialize client resources", -ENOMEM);
-
-	rdma_ack_cm_event(cm_event);
-
-	// 큐 페어 초기화
-	ret = server_init_qp(client_res);
-	if (ret)
-		return ret;
-
-	// 클라이언트 연결 승인
 	struct rdma_conn_param conn_param = {
 		.initiator_depth = 3,
 		.responder_resources = 3,
 	};
-	if (rdma_accept(client_res->cm_client_id, &conn_param))
-	{
-		return handle_error("Failed to accept client connection", -errno);
-	}
 
-	// 연결 확립 이벤트 처리
+	if (rdma_accept(client_res->cm_client_id, &conn_param))
+		return handle_error("Failed to accept client connection");
+
 	struct rdma_cm_event *cm_event2 = NULL;
 	if (process_rdma_cm_event(res->cm_event_channel, RDMA_CM_EVENT_ESTABLISHED, &cm_event2))
-	{
-		return handle_error("Failed to get RDMA_CM_EVENT_ESTABLISHED", -errno);
-	}
+		return handle_error("Failed to get RDMA_CM_EVENT_ESTABLISHED");
+
 	rdma_ack_cm_event(cm_event2);
+	printf("Finish Connect RDMA cm id at %p\n", cm_event2->id);
 
-	printf("Finish Connect RDMA cm id at %p \n", cm_event2->id);
-
-	// 메타데이터 전송
 	ret = server_send_metadata(client_res, res);
 	if (ret)
 		return ret;
 
-	// 클라이언트 배열에 추가
 	res->client_res = realloc(res->client_res, sizeof(struct rdma_connected_client_resources *) * (res->num_clients + 1));
 	if (!res->client_res)
-		return handle_error("Failed to realloc client resources", -ENOMEM);
+		return handle_error("Failed to realloc client resources");
 
 	res->client_res[res->num_clients] = client_res;
 	res->num_clients++;
 
 	printf("New client connected. Total clients: %d\n", res->num_clients);
-
 	return 0;
 }
 
 /* 서버 종료 및 클라이언트 리소스 해제 */
 static int server_cleanup(struct rdma_server_resources *res)
 {
-	printf("Star Server shut-down is complete\n");
+	printf("Start Server shutdown\n");
+
 	for (int i = 0; i < res->num_clients; i++)
 	{
 		struct rdma_connected_client_resources *client_res = res->client_res[i];
@@ -280,73 +252,54 @@ static int server_cleanup(struct rdma_server_resources *res)
 	rdma_destroy_id(res->cm_server_id);
 	rdma_destroy_event_channel(res->cm_event_channel);
 	free(res->client_res);
-	// free(res->server_buffer.str);
-	printf("Server shut-down is complete\n");
+
+	printf("Server shutdown complete\n");
 	return 0;
 }
 
 /* Main function */
 int main(int argc, char **argv)
 {
-	int ret;
-	struct sockaddr_in server_sockaddr;
-	struct rdma_server_resources res;
-	bzero(&res, sizeof(res));
+	if (argc < 2)
+	{
+		fprintf(stderr, "Usage: %s <text_to_send>\n", argv[0]);
+		return -1;
+	}
 
-	/* Initialize server address */
-	bzero(&server_sockaddr, sizeof(server_sockaddr));
+	struct rdma_server_resources res;
+	memset(&res, 0, sizeof(res));
+
+	// 서버 주소 초기화
+	struct sockaddr_in server_sockaddr;
+	memset(&server_sockaddr, 0, sizeof(server_sockaddr));
 	server_sockaddr.sin_family = AF_INET;
 	server_sockaddr.sin_addr.s_addr = inet_addr("10.10.16.51");
 	server_sockaddr.sin_port = htons(DEFAULT_RDMA_PORT);
 
-	const char *text_to_send = argv[1]; // 첫 번째 인자로부터 데이터 받음
-
-	/* Allocate Server buffer*/
-	// res.server_buffer.str = calloc(1, SERVER_DATA_LEN);
-	// if (!res.server_buffer.str)
-	// {
-	// 	rdma_error("failed to allocate buffer, -ENOMEM\n");
-	// 	return ret;
-	// }
-
+	const char *text_to_send = argv[1];
 	strncpy(res.server_buffer.str, text_to_send, strlen(text_to_send));
 
-	printf("server_buffer %s\n", res.server_buffer.str);
+	// RDMA 서버 시작
+	if (server_prepare_connection(&server_sockaddr, &res))
+		return handle_error("Failed to start RDMA server");
 
-	/* Start RDMA server */
-	ret = server_prepare_connection(&server_sockaddr, &res);
-	if (ret)
-	{
-		rdma_error("Failed to start RDMA server\n");
-		return ret;
-	}
-
+	// 클라이언트 연결 처리
 	for (int i = 0; i < 2; i++)
 	{
-		/* Send server metadata */
-		ret = server_accept_client(&res);
-		if (ret)
-		{
-			rdma_error("Failed to send server metadata\n");
-			return ret;
-		}
+		if (server_accept_client(&res))
+			return handle_error("Failed to accept client");
 	}
 
 	for (int i = 0; i < 2; i++)
 	{
 		server_disconnect_wait(&res);
 	}
+	// 클라이언트가 작성한 데이터를 출력
+	printf("Client wrote the following data: %ld, %s\n", res.server_buffer.flag, res.server_buffer.str);
 
-	// 클라이언트가 write한 데이터를 출력
-	printf("Client wrote the following data: %s\n", res.server_buffer.str);
-
-	/* Disconnect and cleanup */
-	ret = server_cleanup(&res);
-	if (ret)
-	{
-		rdma_error("Failed to cleanup server resources\n");
-		return ret;
-	}
+	// 서버 종료 및 리소스 해제
+	if (server_cleanup(&res))
+		return handle_error("Failed to cleanup server resources");
 
 	return 0;
 }
